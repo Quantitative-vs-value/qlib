@@ -1,8 +1,9 @@
 from ...utils.serial import Serializable
-from typing import Union, List, Tuple
+from typing import Union, List, Tuple, Dict, Text, Optional
 from ...utils import init_instance_by_config, np_ffill
 from ...log import get_module_logger
 from .handler import DataHandler, DataHandlerLP
+from copy import deepcopy
 from inspect import getfullargspec
 import pandas as pd
 import numpy as np
@@ -16,22 +17,28 @@ class Dataset(Serializable):
     Preparing data for model training and inferencing.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, **kwargs):
         """
         init is designed to finish following steps:
+
+        - init the sub instance and the state of the dataset(info to prepare the data)
+            - The name of essential state for preparing data should not start with '_' so that it could be serialized on disk when serializing.
 
         - setup data
             - The data related attributes' names should start with '_' so that it will not be saved on disk when serializing.
 
-        - initialize the state of the dataset(info to prepare the data)
-            - The name of essential state for preparing data should not start with '_' so that it could be serialized on disk when serializing.
-
         The data could specify the info to caculate the essential data for preparation
         """
-        self.setup_data(*args, **kwargs)
+        self.setup_data(**kwargs)
         super().__init__()
 
-    def setup_data(self, *args, **kwargs):
+    def config(self, **kwargs):
+        """
+        config is designed to configure and parameters that cannot be learned from the data
+        """
+        super().config(**kwargs)
+
+    def setup_data(self, **kwargs):
         """
         Setup the data.
 
@@ -39,7 +46,7 @@ class Dataset(Serializable):
 
         - User have a Dataset object with learned status on disk.
 
-        - User load the Dataset object from the disk(Note the init function is skiped).
+        - User load the Dataset object from the disk.
 
         - User call `setup_data` to load new data.
 
@@ -47,7 +54,7 @@ class Dataset(Serializable):
         """
         pass
 
-    def prepare(self, *args, **kwargs) -> object:
+    def prepare(self, **kwargs) -> object:
         """
         The type of dataset depends on the model. (It could be pd.DataFrame, pytorch.DataLoader, etc.)
         The parameters should specify the scope for the prepared data
@@ -76,18 +83,7 @@ class DatasetH(Dataset):
     - The processing is related to data split.
     """
 
-    def __init__(self, handler: Union[dict, DataHandler], segments: list):
-        """
-        Parameters
-        ----------
-        handler : Union[dict, DataHandler]
-            handler will be passed into setup_data.
-        segments : list
-            handler will be passed into setup_data.
-        """
-        super().__init__(handler, segments)
-
-    def setup_data(self, handler: Union[dict, DataHandler], segments: list):
+    def __init__(self, handler: Union[Dict, DataHandler], segments: Dict[Text, Tuple], **kwargs):
         """
         Setup the underlying data.
 
@@ -100,7 +96,7 @@ class DatasetH(Dataset):
 
             - config of `DataHandler`.  Please refer to `DataHandler`
 
-        segments : list
+        segments : dict
             Describe the options to segment the data.
             Here are some examples:
 
@@ -116,8 +112,56 @@ class DatasetH(Dataset):
                         'outsample': ("2017-01-01", "2020-08-01",),
                     }
         """
-        self._handler = init_instance_by_config(handler, accept_types=DataHandler)
-        self._segments = segments.copy()
+        self.handler = init_instance_by_config(handler, accept_types=DataHandler)
+        self.segments = segments.copy()
+        super().__init__(**kwargs)
+
+    def config(self, handler_kwargs: dict = None, **kwargs):
+        """
+        Initialize the DatasetH
+
+        Parameters
+        ----------
+        handler_kwargs : dict
+            Config of DataHanlder, which could include the following arguments:
+
+            - arguments of DataHandler.conf_data, such as 'instruments', 'start_time' and 'end_time'.
+
+        kwargs : dict
+            Config of DatasetH, such as
+
+            - segments : dict
+                Config of segments which is same as 'segments' in self.__init__
+
+        """
+        if handler_kwargs is not None:
+            self.handler.config(**handler_kwargs)
+        if "segments" in kwargs:
+            self.segments = deepcopy(kwargs.pop("segments"))
+        super().config(**kwargs)
+
+    def setup_data(self, handler_kwargs: dict = None, **kwargs):
+        """
+        Setup the Data
+
+        Parameters
+        ----------
+        handler_kwargs : dict
+            init arguments of DataHanlder, which could include the following arguments:
+
+            - init_type : Init Type of Handler
+
+            - enable_cache : wheter to enable cache
+
+        """
+        super().setup_data(**kwargs)
+        if handler_kwargs is not None:
+            self.handler.setup_data(**handler_kwargs)
+
+    def __repr__(self):
+        return "{name}(handler={handler}, segments={segments})".format(
+            name=self.__class__.__name__, handler=self.handler, segments=self.segments
+        )
 
     def _prepare_seg(self, slc: slice, **kwargs):
         """
@@ -127,11 +171,11 @@ class DatasetH(Dataset):
         ----------
         slc : slice
         """
-        return self._handler.fetch(slc, **kwargs)
+        return self.handler.fetch(slc, **kwargs)
 
     def prepare(
         self,
-        segments: Union[List[str], Tuple[str], str, slice],
+        segments: Union[List[Text], Tuple[Text], Text, slice],
         col_set=DataHandler.CS_ALL,
         data_key=DataHandlerLP.DK_I,
         **kwargs,
@@ -141,7 +185,7 @@ class DatasetH(Dataset):
 
         Parameters
         ----------
-        segments : Union[List[str], Tuple[str], str, slice]
+        segments : Union[List[Text], Tuple[Text], Text, slice]
             Describe the scope of the data to be prepared
             Here are some examples:
 
@@ -150,7 +194,7 @@ class DatasetH(Dataset):
             - ['train', 'valid']
 
         col_set : str
-            The col_set will be passed to self._handler when fetching data.
+            The col_set will be passed to self.handler when fetching data.
         data_key : str
             The data to fetch:  DK_*
             Default is DK_I, which indicate fetching data for **inference**.
@@ -166,16 +210,16 @@ class DatasetH(Dataset):
         logger = get_module_logger("DatasetH")
         fetch_kwargs = {"col_set": col_set}
         fetch_kwargs.update(kwargs)
-        if "data_key" in getfullargspec(self._handler.fetch).args:
+        if "data_key" in getfullargspec(self.handler.fetch).args:
             fetch_kwargs["data_key"] = data_key
         else:
             logger.info(f"data_key[{data_key}] is ignored.")
 
         # Handle all kinds of segments format
         if isinstance(segments, (list, tuple)):
-            return [self._prepare_seg(slice(*self._segments[seg]), **fetch_kwargs) for seg in segments]
+            return [self._prepare_seg(slice(*self.segments[seg]), **fetch_kwargs) for seg in segments]
         elif isinstance(segments, str):
-            return self._prepare_seg(slice(*self._segments[segments]), **fetch_kwargs)
+            return self._prepare_seg(slice(*self.segments[segments]), **fetch_kwargs)
         elif isinstance(segments, slice):
             return self._prepare_seg(segments, **fetch_kwargs)
         else:
@@ -228,7 +272,7 @@ class TSDataSampler:
         self.fillna_type = fillna_type
         assert get_level_index(data, "datetime") == 0
         self.data = lazy_sort_index(data)
-        self.data_arr = np.array(self.data)  # Get index from numpy.array will much faster than DataFrame.values! But
+        self.data_arr = np.array(self.data)  # Get index from numpy.array will much faster than DataFrame.values!
         # NOTE: append last line with full NaN for better performance in `__getitem__`
         self.data_arr = np.append(self.data_arr, np.full((1, self.data_arr.shape[1]), np.nan), axis=0)
         self.nan_idx = -1  # The last line is all NaN
@@ -236,7 +280,6 @@ class TSDataSampler:
         # the data type will be changed
         # The index of usable data is between start_idx and end_idx
         self.start_idx, self.end_idx = self.data.index.slice_locs(start=pd.Timestamp(start), end=pd.Timestamp(end))
-        # self.index_link = self.build_link(self.data)
         self.idx_df, self.idx_map = self.build_index(self.data)
         self.idx_arr = np.array(self.idx_df.values, dtype=np.float64)  # for better performance
 
@@ -371,7 +414,7 @@ class TSDataSampler:
         # 1) for better performance, use the last nan line for padding the lost date
         # 2) In case of precision problems. We use np.float64. # TODO: I'm not sure if whether np.float64 will result in
         # precision problems. It will not cause any problems in my tests at least
-        indices = np.nan_to_num(indices.astype(np.float64), nan=self.nan_idx).astype(np.int)
+        indices = np.nan_to_num(indices.astype(np.float64), nan=self.nan_idx).astype(int)
 
         data = self.data_arr[indices]
         if isinstance(idx, mtit):
@@ -403,15 +446,19 @@ class TSDatasetH(DatasetH):
         - The dimension of a batch of data <batch_idx, feature, timestep>
     """
 
-    def __init__(self, step_len=30, *args, **kwargs):
+    def __init__(self, step_len=30, **kwargs):
         self.step_len = step_len
-        super().__init__(*args, **kwargs)
+        super().__init__(**kwargs)
 
-    def setup_data(self, *args, **kwargs):
-        super().setup_data(*args, **kwargs)
-        cal = self._handler.fetch(col_set=self._handler.CS_RAW).index.get_level_values("datetime").unique()
+    def config(self, **kwargs):
+        if "step_len" in kwargs:
+            self.step_len = kwargs.pop("step_len")
+        super().config(**kwargs)
+
+    def setup_data(self, **kwargs):
+        super().setup_data(**kwargs)
+        cal = self.handler.fetch(col_set=self.handler.CS_RAW).index.get_level_values("datetime").unique()
         cal = sorted(cal)
-        # Get the datatime index for building timestamp
         self.cal = cal
 
     def _prepare_seg(self, slc: slice, **kwargs) -> TSDataSampler:

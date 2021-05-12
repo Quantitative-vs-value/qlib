@@ -3,8 +3,7 @@
 
 
 import logging
-import logging.handlers
-import os
+from typing import Optional, Text, Dict, Any
 import re
 from logging import config as logging_config
 from time import time
@@ -13,16 +12,47 @@ from contextlib import contextmanager
 from .config import C
 
 
-def get_module_logger(module_name, level=None):
+class MetaLogger(type):
+    def __new__(cls, name, bases, dict):
+        wrapper_dict = logging.Logger.__dict__.copy()
+        for key in wrapper_dict:
+            if key not in dict and key != "__reduce__":
+                dict[key] = wrapper_dict[key]
+        return type.__new__(cls, name, bases, dict)
+
+
+class QlibLogger(metaclass=MetaLogger):
+    """
+    Customized logger for Qlib.
+    """
+
+    def __init__(self, module_name):
+        self.module_name = module_name
+        self.level = 0
+
+    @property
+    def logger(self):
+        logger = logging.getLogger(self.module_name)
+        logger.setLevel(self.level)
+        return logger
+
+    def setLevel(self, level):
+        self.level = level
+
+    def __getattr__(self, name):
+        # During unpickling, python will call __getattr__. Use this line to avoid maximum recursion error.
+        if name in {"__setstate__"}:
+            raise AttributeError
+        return self.logger.__getattribute__(name)
+
+
+def get_module_logger(module_name, level: Optional[int] = None) -> logging.Logger:
     """
     Get a logger for a specific module.
 
     :param module_name: str
         Logic module name.
     :param level: int
-    :param sh_level: int
-        Stream handler log level.
-    :param log_format: str
     :return: Logger
         Logger object.
     """
@@ -31,7 +61,7 @@ def get_module_logger(module_name, level=None):
 
     module_name = "qlib.{}".format(module_name)
     # Get logger.
-    module_logger = logging.getLogger(module_name)
+    module_logger = QlibLogger(module_name)
     module_logger.setLevel(level)
     return module_logger
 
@@ -103,7 +133,7 @@ class TimeInspector:
         cls.log_cost_time(info=f"{name} Done")
 
 
-def set_log_with_config(log_config: dict):
+def set_log_with_config(log_config: Dict[Text, Any]):
     """set log with config
 
     :param log_config:
@@ -133,3 +163,10 @@ class LogFilter(logging.Filter):
         elif isinstance(self.param, list):
             allow = not any([self.match_msg(p, record.msg) for p in self.param])
         return allow
+
+
+def set_global_logger_level(level: int):
+    qlib_logger = logging.root.manager.loggerDict.get("qlib", None)
+    if qlib_logger is not None:
+        for _handler in qlib_logger.handlers:
+            _handler.level = level

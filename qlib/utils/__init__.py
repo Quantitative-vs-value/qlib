@@ -24,10 +24,10 @@ import collections
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import Union, Tuple
+from typing import Union, Tuple, Text, Optional
 
 from ..config import C
-from ..log import get_module_logger
+from ..log import get_module_logger, set_log_with_config
 
 log = get_module_logger("utils")
 
@@ -64,7 +64,7 @@ def np_ffill(arr: np.array):
     arr : np.array
         Input numpy 1D array
     """
-    mask = np.isnan(arr.astype(np.float))  # np.isnan only works on np.float
+    mask = np.isnan(arr.astype(float))  # np.isnan only works on np.float
     # get fill index
     idx = np.where(~mask, np.arange(mask.shape[0]), 0)
     np.maximum.accumulate(idx, out=idx)
@@ -128,10 +128,10 @@ def parse_config(config):
     # Check whether config is file
     if os.path.exists(config):
         with open(config, "r") as f:
-            return yaml.load(f)
+            return yaml.safe_load(f)
     # Check whether the str can be parsed
     try:
-        return yaml.load(config)
+        return yaml.safe_load(config)
     except BaseException:
         raise ValueError("cannot parse config!")
 
@@ -162,7 +162,7 @@ def parse_field(field):
     # - $open+$close -> Feature("open")+Feature("close")
     if not isinstance(field, str):
         field = str(field)
-    return re.sub(r"\$(\w+)", r'Feature("\1")', field)
+    return re.sub(r"\$(\w+)", r'Feature("\1")', re.sub(r"(\w+\s*)\(", r"Operators.\1(", field))
 
 
 def get_module_by_module_path(module_path):
@@ -212,7 +212,7 @@ def get_cls_kwargs(config: Union[dict, str], module) -> (type, dict):
 
 
 def init_instance_by_config(
-    config: Union[str, dict, object], module=None, accept_types: Union[type, Tuple[type]] = tuple([]), **kwargs
+    config: Union[str, dict, object], module=None, accept_types: Union[type, Tuple[type]] = (), **kwargs
 ) -> object:
     """
     get initialized instance with config
@@ -276,23 +276,31 @@ def compare_dict_value(src_data: dict, dst_data: dict):
     return changes
 
 
-def create_save_path(save_path=None):
-    """Create save path
+def get_or_create_path(path: Optional[Text] = None, return_dir: bool = False):
+    """Create or get a file or directory given the path and return_dir.
 
     Parameters
     ----------
-    save_path: str
+    path: a string indicates the path or None indicates creating a temporary path.
+    return_dir: if True, create and return a directory; otherwise c&r a file.
 
     """
-    if save_path:
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
+    if path:
+        if return_dir and not os.path.exists(path):
+            os.makedirs(path)
+        elif not return_dir:  # return a file, thus we need to create its parent directory
+            xpath = os.path.abspath(os.path.join(path, ".."))
+            if not os.path.exists(xpath):
+                os.makedirs(xpath)
     else:
         temp_dir = os.path.expanduser("~/tmp")
         if not os.path.exists(temp_dir):
             os.makedirs(temp_dir)
-        _, save_path = tempfile.mkstemp(dir=temp_dir)
-    return save_path
+        if return_dir:
+            _, path = tempfile.mkdtemp(dir=temp_dir)
+        else:
+            _, path = tempfile.mkstemp(dir=temp_dir)
+    return path
 
 
 @contextlib.contextmanager
@@ -643,13 +651,26 @@ def exists_qlib_data(qlib_dir):
     # check instruments
     code_names = set(map(lambda x: x.name.lower(), features_dir.iterdir()))
     _instrument = instruments_dir.joinpath("all.txt")
-    df = pd.read_csv(_instrument, sep="\t", names=["inst", "start_datetime", "end_datetime", "save_inst"])
-    df = df.iloc[:, [0, -1]].fillna(axis=1, method="ffill")
-    miss_code = set(df.iloc[:, -1].apply(str.lower)) - set(code_names)
+    miss_code = set(pd.read_csv(_instrument, sep="\t", header=None).loc[:, 0].apply(str.lower)) - set(code_names)
     if miss_code and any(map(lambda x: "sht" not in x, miss_code)):
         return False
 
     return True
+
+
+def check_qlib_data(qlib_config):
+    inst_dir = Path(qlib_config["provider_uri"]).joinpath("instruments")
+    for _p in inst_dir.glob("*.txt"):
+        try:
+            assert len(pd.read_csv(_p, sep="\t", nrows=0, header=None).columns) == 3, (
+                f"\nThe {str(_p.resolve())} of qlib data is not equal to 3 columns:"
+                f"\n\tIf you are using the data provided by qlib: "
+                f"https://qlib.readthedocs.io/en/latest/component/data.html#qlib-format-dataset"
+                f"\n\tIf you are using your own data, please dump the data again: "
+                f"https://qlib.readthedocs.io/en/latest/component/data.html#converting-csv-format-into-qlib-format"
+            )
+        except AssertionError:
+            raise
 
 
 def lazy_sort_index(df: pd.DataFrame, axis=0) -> pd.DataFrame:
@@ -709,6 +730,9 @@ class Wrapper:
     def register(self, provider):
         self._provider = provider
 
+    def __repr__(self):
+        return "{name}(provider={provider})".format(name=self.__class__.__name__, provider=self._provider)
+
     def __getattr__(self, key):
         if self._provider is None:
             raise AttributeError("Please run qlib.init() first using qlib")
@@ -742,3 +766,36 @@ def load_dataset(path_or_obj):
     elif extension == ".csv":
         return pd.read_csv(path_or_obj, parse_dates=True, index_col=[0, 1])
     raise ValueError(f"unsupported file type `{extension}`")
+
+
+def code_to_fname(code: str):
+    """stock code to file name
+
+    Parameters
+    ----------
+    code: str
+    """
+    # NOTE: In windows, the following name is I/O device, and the file with the corresponding name cannot be created
+    # reference: https://superuser.com/questions/86999/why-cant-i-name-a-folder-or-file-con-in-windows
+    replace_names = ["CON", "PRN", "AUX", "NUL"]
+    replace_names += [f"COM{i}" for i in range(10)]
+    replace_names += [f"LPT{i}" for i in range(10)]
+
+    prefix = "_qlib_"
+    if str(code).upper() in replace_names:
+        code = prefix + str(code)
+
+    return code
+
+
+def fname_to_code(fname: str):
+    """file name to stock code
+
+    Parameters
+    ----------
+    fname: str
+    """
+    prefix = "_qlib_"
+    if fname.startswith(prefix):
+        fname = fname.lstrip(prefix)
+    return fname
